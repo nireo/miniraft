@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Read, Write};
+use std::net::SocketAddr;
 use std::os::unix::prelude::FileExt;
+use std::sync::{Mutex, mpsc};
+use std::time::{Duration, Instant};
 
 struct PageCache {
     file: std::fs::File,
@@ -475,5 +478,181 @@ impl DurableState {
             "Could not find index {index} with log length: {}.",
             self.next_log_index
         );
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Debug)]
+enum Condition {
+    Leader,
+    Follower,
+    Candidate,
+}
+
+impl std::fmt::Display for Condition {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+struct VolatileState {
+    condition: Condition,
+
+    commit_index: u64,
+    last_applied: u64,
+
+    // Timeouts
+    election_frequency: Duration,
+    election_timeout: Instant,
+    rand: Random,
+
+    // Leader-only state.
+    next_index: Vec<u64>,
+    match_index: Vec<u64>,
+
+    // Candidate-only state.
+    votes: usize,
+}
+
+impl VolatileState {
+    fn new(cluster_size: usize, election_frequency: Duration, rand: Random) -> VolatileState {
+        let jitter = election_frequency.as_secs_f64() / 3.0;
+        VolatileState {
+            condition: Condition::Follower,
+            commit_index: 0,
+            last_applied: 0,
+            next_index: vec![0; cluster_size],
+            match_index: vec![0; cluster_size],
+            votes: 0,
+
+            election_frequency,
+            election_timeout: Instant::now() + Duration::from_secs_f64(jitter),
+            rand,
+        }
+    }
+
+    fn reset(&mut self) {
+        let count = self.next_index.len();
+        for i in 0..count {
+            self.next_index[i] = 0;
+            self.match_index[i] = 0;
+        }
+        self.votes = 0;
+    }
+}
+
+#[derive(Clone)]
+struct Logger {
+    server_id: u128,
+    debug: bool,
+}
+
+impl Logger {
+    fn log<S: AsRef<str> + std::fmt::Display>(
+        &self,
+        term: u64,
+        log_len: u64,
+        condition: Condition,
+        msg: S,
+    ) {
+        if !self.debug {
+            return;
+        }
+
+        println!(
+            "[S: {: <3} T: {: <3} L: {: <3} C: {}] {}",
+            self.server_id,
+            term,
+            log_len,
+            match condition {
+                Condition::Leader => "L",
+                Condition::Candidate => "C",
+                Condition::Follower => "F",
+            },
+            msg
+        );
+    }
+}
+
+struct State {
+    logger: Logger,
+    durable: DurableState,
+    volatile: VolatileState,
+    stopped: bool,
+}
+
+impl State {
+    fn log<S: AsRef<str> + std::fmt::Display>(&self, msg: S) {
+        self.logger.log(
+            self.durable.current_term,
+            self.durable.next_log_index,
+            self.volatile.condition,
+            msg,
+        );
+    }
+
+    fn next_request_id(&mut self) -> u64 {
+        self.volatile.rand.generate_u64()
+    }
+
+    fn reset_election_timeout(&mut self) {
+        let random_percent = self.volatile.rand.generate_percent();
+        let positive = self.volatile.rand.generate_bool();
+        let jitter = random_percent as f64 * (self.volatile.election_frequency.as_secs_f64() / 2.0);
+
+        let mut new_timeout = self.volatile.election_frequency;
+        // Duration apparently isn't allowed to be negative.
+        if positive {
+            new_timeout += Duration::from_secs_f64(jitter);
+        } else {
+            new_timeout -= Duration::from_secs_f64(jitter);
+        }
+
+        self.volatile.election_timeout = Instant::now() + new_timeout;
+
+        self.log(format!(
+            "Resetting election timeout: {}ms.",
+            new_timeout.as_millis()
+        ));
+    }
+
+    fn transition(&mut self, condition: Condition, term_increase: u64, voted_for: u128) {
+        assert_ne!(self.volatile.condition, condition);
+        self.log(format!("Became {}.", condition));
+        self.volatile.condition = condition;
+        // Reset vote.
+        self.durable
+            .update(self.durable.current_term + term_increase, voted_for);
+    }
+}
+
+#[derive(Copy, Clone)]
+struct ServerConfig {
+    id: u128,
+    address: SocketAddr,
+}
+
+struct Config {
+    server_index: usize,
+    server_id: u128,
+    cluster: Vec<ServerConfig>,
+    election_freq: Duration,
+    page_cache_size: usize,
+}
+
+trait StateMachine {
+    fn apply(&self, messages: Vec<Vec<u8>>) -> Vec<Vec<u8>>;
+}
+
+struct Server<S: StateMachine> {
+    config: Config,
+    sm: S,
+    state: Mutex<State>,
+    client_id: u128,
+    apply_sender: mpsc::Sender<Vec<u8>>,
+}
+
+impl<S: StateMachine> Drop for Server<S> {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
