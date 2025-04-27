@@ -380,6 +380,10 @@ impl DurableState {
         }
     }
 
+    fn append(&mut self, entries: &mut [LogEntry]) {
+        self.append_from_index(entries, self.next_log_index);
+    }
+
     fn append_from_index(&mut self, entries: &mut [LogEntry], from_index: u64) {
         let mut buffer: [u8; PAGESIZE as usize] = [0; PAGESIZE as usize];
         self.next_log_offset = self.offset_from_index(from_index);
@@ -651,8 +655,97 @@ struct Server<S: StateMachine> {
     apply_sender: mpsc::Sender<Vec<u8>>,
 }
 
+#[derive(Debug, PartialEq)]
+enum ApplyResult {
+    NotALeader,
+    Ok,
+}
+
 impl<S: StateMachine> Drop for Server<S> {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+impl<S: StateMachine> Server<S> {
+    pub fn apply(&mut self, commands: Vec<Vec<u8>>, command_ids: Vec<u128>) -> ApplyResult {
+        assert_eq!(commands.len(), command_ids.len());
+        let mut state = self.state.lock().unwrap();
+        if state.volatile.condition != Condition::Leader {
+            return ApplyResult::NotALeader;
+        }
+
+        let mut entries = Vec::with_capacity(commands.len());
+        for (i, &id) in command_ids.iter().enumerate() {
+            assert_ne!(id, 0);
+
+            entries.push(LogEntry {
+                index: 0,
+                term: state.durable.current_term,
+                command: commands[i].clone(),
+                client_serial_id: id,
+                client_id: self.client_id,
+            });
+        }
+
+        state.durable.append(&mut entries);
+        ApplyResult::Ok
+    }
+
+    pub fn stop(&mut self) {
+        let mut state = match self.state.lock() {
+            Ok(s) => s,
+            Err(p) => p.into_inner(),
+        };
+
+        state.log("stopping.");
+        if state.volatile.condition != Condition::Follower {
+            state.transition(Condition::Follower, 0, 0);
+        }
+        state.stopped = true;
+    }
+
+    pub fn new(
+        client_id: u128,
+        data_directory: &std::path::Path,
+        s: S,
+        config: Config,
+    ) -> (Server<S>, mpsc::Receiver<Vec<u8>>) {
+        for server in config.cluster.iter() {
+            assert_ne!(server.id, 0);
+        }
+
+        // 0 is reserved for control messages.
+        assert!(client_id > 0);
+
+        let cluster_size = config.cluster.len();
+        let logger = Logger {
+            server_id: config.server_id,
+            debug: config.logger_debug,
+        };
+        let election_frequency = config.election_frequency;
+
+        let id = config.server_id;
+        let page_cache_size = config.page_cache_size;
+
+        let (apply_sender, apply_receiver): (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) =
+            mpsc::channel();
+
+        (
+            Server {
+                client_id,
+                config,
+                sm: s,
+                apply_sender,
+
+                state: Mutex::new(State {
+                    durable: DurableState::new(data_directory, id, page_cache_size),
+                    volatile: VolatileState::new(cluster_size, election_frequency, rand),
+                    logger,
+                    stopped: false,
+                }),
+            },
+            apply_receiver,
+        )
     }
 }
